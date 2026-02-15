@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph},
     Frame, Terminal,
 };
+use serde::Deserialize;
 use std::{
     fs,
     io::{self, stdout},
@@ -18,10 +19,37 @@ use std::{
     time::SystemTime,
 };
 
-const SCAN_DIRS: &[&str] = &["Documents/app", "Documents/playground"];
-const OBSIDIAN_DOCS: &str = "Library/Mobile Documents/iCloud~md~obsidian/Documents/NV/Personal/App";
+#[derive(Deserialize)]
+struct Config {
+    scan_dirs: Vec<String>,
+    exclude: Option<Vec<String>>,
+    obsidian: Option<ObsidianConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct ObsidianConfig {
+    docs_path: String,
+    vault: String,
+    file_prefix: String,
+}
+
+fn load_config() -> Config {
+    let config_path = dirs::home_dir()
+        .expect("Cannot find home directory")
+        .join(".config/claude-tui/config.toml");
+
+    fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or(Config {
+            scan_dirs: vec!["Documents/app".into(), "Documents/playground".into()],
+            exclude: None,
+            obsidian: None,
+        })
+}
 
 struct App {
+    config: Config,
     projects: Vec<Project>,
     list_state: ListState,
     searching: bool,
@@ -47,10 +75,10 @@ fn normalize(name: &str) -> String {
 }
 
 /// Find the matching Obsidian doc for a project by fuzzy name matching.
-/// e.g. project "daily-digest" matches doc "Daily Digest.md"
-fn find_obsidian_doc(project_name: &str) -> Option<PathBuf> {
+fn find_obsidian_doc(project_name: &str, obsidian: &Option<ObsidianConfig>) -> Option<PathBuf> {
+    let obs = obsidian.as_ref()?;
     let home = dirs::home_dir()?;
-    let docs_dir = home.join(OBSIDIAN_DOCS);
+    let docs_dir = home.join(&obs.docs_path);
     let normalized_project = normalize(project_name);
 
     let entries = fs::read_dir(&docs_dir).ok()?;
@@ -79,11 +107,12 @@ fn format_relative_time(time: Option<SystemTime>) -> String {
     }
 }
 
-fn scan_projects() -> Vec<Project> {
+fn scan_projects(config: &Config) -> Vec<Project> {
     let home = dirs::home_dir().expect("Cannot find home directory");
+    let exclude: Vec<String> = config.exclude.clone().unwrap_or_default();
     let mut projects = Vec::new();
 
-    for dir in SCAN_DIRS {
+    for dir in &config.scan_dirs {
         let full_path = home.join(dir);
         let source = dir.rsplit('/').next().unwrap_or(dir);
 
@@ -92,8 +121,8 @@ fn scan_projects() -> Vec<Project> {
                 let path = entry.path();
                 if path.is_dir() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with('.') && name != "claude-tui" {
-                        let has_doc = find_obsidian_doc(&name).is_some();
+                    if !name.starts_with('.') && !exclude.contains(&name) {
+                        let has_doc = find_obsidian_doc(&name, &config.obsidian).is_some();
                         let is_git = path.join(".git").exists();
 
                         // Git info
@@ -183,12 +212,14 @@ fn scan_projects() -> Vec<Project> {
 
 impl App {
     fn new() -> Self {
-        let projects = scan_projects();
+        let config = load_config();
+        let projects = scan_projects(&config);
         let mut list_state = ListState::default();
         if !projects.is_empty() {
             list_state.select(Some(0));
         }
         Self {
+            config,
             projects,
             list_state,
             searching: false,
@@ -257,16 +288,19 @@ impl App {
     }
 
     fn open_doc(&self) {
+        let Some(obs) = &self.config.obsidian else { return };
         if let Some(project) = self.selected_project() {
-            if let Some(doc_path) = find_obsidian_doc(&project.name) {
-                // Get the filename without .md extension for the Obsidian URI
+            if let Some(doc_path) = find_obsidian_doc(&project.name, &self.config.obsidian) {
                 let file_stem = doc_path
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy();
+                let prefix = obs.file_prefix.replace('/', "%2F");
                 let uri = format!(
-                    "obsidian://open?vault=NV&file=Personal%2FApp%2F{}",
-                    file_stem.replace(' ', "%20")
+                    "obsidian://open?vault={}&file={}%2F{}",
+                    obs.vault.replace(' ', "%20"),
+                    prefix,
+                    file_stem.replace(' ', "%20"),
                 );
                 Command::new("open").arg(uri).spawn().ok();
             }
