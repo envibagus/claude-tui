@@ -12,6 +12,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     fs,
     io::{self, stdout},
     path::PathBuf,
@@ -66,6 +67,7 @@ struct Project {
     git_branch: Option<String>,
     git_dirty: bool,
     config_labels: Vec<String>,
+    active_rss_kb: Option<u64>,
 }
 
 /// Normalize a name for fuzzy matching: lowercase, strip hyphens/spaces/underscores
@@ -105,6 +107,92 @@ fn format_relative_time(time: Option<SystemTime>) -> String {
         2592000..=31535999 => format!("{}mo ago", secs / 2592000),
         _ => format!("{}y ago", secs / 31536000),
     }
+}
+
+fn format_rss(kb: u64) -> String {
+    if kb >= 1_048_576 {
+        format!("{:.1}G", kb as f64 / 1_048_576.0)
+    } else if kb >= 1024 {
+        format!("{}M", kb / 1024)
+    } else {
+        format!("{}K", kb)
+    }
+}
+
+/// Detect running Claude Code sessions and their RAM usage per working directory.
+fn detect_active_sessions() -> HashMap<PathBuf, u64> {
+    let mut result: HashMap<PathBuf, u64> = HashMap::new();
+
+    let ps_out = Command::new("ps")
+        .args(["-xo", "pid,ppid,rss,args"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    struct Proc { rss_kb: u64, args: String }
+    let mut procs: HashMap<u32, Proc> = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    for line in ps_out.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let pid = parts[0].parse::<u32>().unwrap_or(0);
+            let ppid = parts[1].parse::<u32>().unwrap_or(0);
+            let rss = parts[2].parse::<u64>().unwrap_or(0);
+            let args = parts[3..].join(" ");
+            procs.insert(pid, Proc { rss_kb: rss, args });
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+
+    let claude_pids: Vec<u32> = procs.iter()
+        .filter(|(_, p)| {
+            let a = &p.args;
+            (a == "claude" || a.starts_with("claude ")
+                || a.contains("/claude ") || a.ends_with("/claude"))
+                && !a.contains("claude-tui")
+                && !a.contains("Claude.app")
+                && !a.contains(".claude/scripts")
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+
+    fn sum_tree(pid: u32, procs: &HashMap<u32, Proc>, children: &HashMap<u32, Vec<u32>>) -> u64 {
+        let own = procs.get(&pid).map(|p| p.rss_kb).unwrap_or(0);
+        let kids: u64 = children.get(&pid)
+            .map(|c| c.iter().map(|&k| sum_tree(k, procs, children)).sum())
+            .unwrap_or(0);
+        own + kids
+    }
+
+    if !claude_pids.is_empty() {
+        let pid_args: String = claude_pids.iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let lsof_out = Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fn", "-p", &pid_args])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        let mut current_pid: Option<u32> = None;
+        for line in lsof_out.lines() {
+            if let Some(pid_str) = line.strip_prefix('p') {
+                current_pid = pid_str.parse().ok();
+            } else if let Some(path_str) = line.strip_prefix('n') {
+                if let Some(pid) = current_pid {
+                    let dir = PathBuf::from(path_str);
+                    let total = sum_tree(pid, &procs, &children);
+                    *result.entry(dir).or_insert(0) += total;
+                }
+            }
+        }
+    }
+
+    result
 }
 
 fn scan_projects(config: &Config) -> Vec<Project> {
@@ -198,10 +286,19 @@ fn scan_projects(config: &Config) -> Vec<Project> {
                             git_branch,
                             git_dirty,
                             config_labels,
+                            active_rss_kb: None,
                         });
                     }
                 }
             }
+        }
+    }
+
+    // Match active Claude sessions to projects
+    let active = detect_active_sessions();
+    for project in &mut projects {
+        if let Some(rss) = active.get(&project.path) {
+            project.active_rss_kb = Some(*rss);
         }
     }
 
@@ -367,6 +464,12 @@ fn draw(frame: &mut Frame, app: &App) {
                 None
             };
 
+            let active_str = p.active_rss_kb.map(|kb| {
+                let s = format!("  ● {}", format_rss(kb));
+                left_len += s.len();
+                s
+            });
+
             if p.has_doc { left_len += 4; } // " doc"
 
             let padding = list_width.saturating_sub(left_len + time_str.len() + 6);
@@ -382,6 +485,10 @@ fn draw(frame: &mut Frame, app: &App) {
 
             if let Some(ref c) = config_str {
                 spans.push(Span::styled(c.clone(), Style::default().fg(Color::DarkGray)));
+            }
+
+            if let Some(ref a) = active_str {
+                spans.push(Span::styled(a.clone(), Style::default().fg(Color::Yellow)));
             }
 
             if p.has_doc {
